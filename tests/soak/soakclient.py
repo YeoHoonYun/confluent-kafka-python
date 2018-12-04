@@ -34,6 +34,7 @@ import time
 import json
 import logging
 import sys
+import datadog
 
 
 class SoakRecord (object):
@@ -63,13 +64,24 @@ class SoakClient (object):
         Both clients print their message and error counters every 10 seconds.
     """
 
+    # DataDog metric name prefix
+    DD_PFX = "kafka.client.soak.python."
+
     def dr_cb(self, err, msg):
         """ Producer delivery report callback """
         if err is not None:
-            self.logger.warning("producer: delivery failed: {} [{}]: {}".format(msg.topic(), msg.partition(), err))
+            self.logger.warning("producer: delivery failed: {} [{}]: {}".
+                                format(msg.topic(), msg.partition(), err))
             self.dr_err_cnt += 1
+            self.dd_incr("producer.drerr", 1)
+            self.dd.event("Message delivery failure",
+                          "Message delivery failed: {} [{}]: {}".
+                          format(msg.topic(), msg.partition(), err),
+                          hostname=self.hostname)
+
         else:
             self.dr_cnt += 1
+            self.dd_incr("producer.drok", 1)
             if (self.dr_cnt % self.disprate) == 0:
                 self.logger.debug("producer: delivered message to {} [{}] at offset {}".format(
                     msg.topic(), msg.partition(), msg.offset()))
@@ -95,6 +107,7 @@ class SoakClient (object):
                 continue
 
         self.producer_msgid += 1
+        self.dd_incr("producer.send", 1)
 
     def producer_stats(self):
         """ Print producer stats """
@@ -180,6 +193,7 @@ class SoakClient (object):
             if msg.error() is not None:
                 self.logger.error("consumer: error: {}".format(msg.error()))
                 self.consumer_err_cnt += 1
+                self.dd_incr("consumer.error", 1)
                 continue
 
             try:
@@ -189,8 +203,10 @@ class SoakClient (object):
                                  "{} [{}] at offset {} (headers {}): {}".format(
                                      msg.topic(), msg.partition(), msg.offset(), msg.headers(), ex))
                 self.msg_err_cnt += 1
+                self.dd_incr("consumer.msgerr", 1)
 
             self.msg_cnt += 1
+            self.dd_incr("consumer.msg", 1)
 
             if (self.msg_cnt % self.disprate) == 0:
                 self.logger.info("consumer: {} messages consumed: Message {} "
@@ -212,6 +228,7 @@ class SoakClient (object):
                                             msg.offset(), msg.headers(), hw,
                                             self.last_committed))
                     self.msg_dup_cnt += (hw + 1) - msg.offset()
+                    self.dd_incr("consumer.msgdup", 1)
                 elif msg.offset() > hw + 1:
                     self.logger.warning("consumer: Lost messages, now at {} "
                                         "[{}] at offset {} (headers {}): "
@@ -220,6 +237,7 @@ class SoakClient (object):
                                             msg.offset(), msg.headers(), hw,
                                             self.last_committed))
                     self.msg_miss_cnt += msg.offset() - (hw + 1)
+                    self.dd_incr("consumer.missedmsg", 1)
 
             hwmarks[hwkey] = msg.offset()
 
@@ -241,12 +259,14 @@ class SoakClient (object):
         """ Consumer error callback """
         self.logger.error("consumer: error_cb: {}".format(err))
         self.consumer_error_cb_cnt += 1
+        self.dd_incr("consumer.errorcb", 1)
 
     def consumer_commit_cb(self, err, partitions):
         """ Auto commit result callback """
         if err is not None:
             self.logger.error("consumer: offset commit failed for {}: {}".format(partitions, err))
             self.consumer_err_cnt += 1
+            self.dd_incr("consumer.error", 1)
         else:
             self.last_committed = partitions
 
@@ -254,6 +274,7 @@ class SoakClient (object):
         """ Producer error callback """
         self.logger.error("producer: error_cb: {}".format(err))
         self.producer_error_cb_cnt += 1
+        self.dd_incr("producer.errorcb", 1)
 
     def stats_cb(self, json_str):
         """ Common statistics callback.
@@ -273,6 +294,9 @@ class SoakClient (object):
         self.stats_cnt[d['type']] += 1
         if (self.stats_cnt[d['type']] % 10) == 0:
             self.logger.info("{} raw stats: {}".format(d['name'], json_str))
+
+        if d['type'] == 'producer':
+            self.dd_gauge("producer.outq", len(self.producer))
 
     def create_topic(self, topic, conf):
         """ Create the topic if it doesn't already exist """
@@ -296,11 +320,19 @@ class SoakClient (object):
         self.stats_cnt = {'producer': 0, 'consumer': 0}
         self.start_time = time.time()
 
+        # Separate datadog config from client config
+        datadog_conf = {k[len("datadog."):]: conf[k]
+                        for k in conf.keys() if k.startswith("datadog.")}
+        conf = {k: v for k, v in conf.items() if not k.startswith("datadog.")}
+
         self.logger = logging.getLogger('soakclient')
         self.logger.setLevel(logging.DEBUG)
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter('%(asctime)-15s %(levelname)-8s %(message)s'))
         self.logger.addHandler(handler)
+
+        # Set up datadog agent
+        self.init_datadog(datadog_conf)
 
         # Create topic (might already exist)
         self.create_topic(self.topic, conf)
@@ -333,6 +365,25 @@ class SoakClient (object):
         self.run = False
         self.producer_thread.join()
         self.consumer_thread.join()
+
+    def init_datadog(self, options):
+        """ Initialize datadog agent """
+        datadog.initialize(**options)
+
+        # DataDog Python agent does not send hostname by default (bug),
+        # explicitly pass one to metrics/events method.
+        self.hostname = datadog.util.hostname.get_hostname()
+
+        self.dd = datadog.ThreadStats()
+        self.dd.start()
+
+    def dd_incr(self, metric_name, incrval):
+        """ Increment datadog metric counter by incrval """
+        self.dd.increment(self.DD_PFX + metric_name, incrval, host=self.hostname)
+
+    def dd_gauge(self, metric_name, val):
+        """ Set datadog metric gauge to val """
+        self.dd.gauge(self.DD_PFX + metric_name, val, host=self.hostname)
 
 
 if __name__ == '__main__':
